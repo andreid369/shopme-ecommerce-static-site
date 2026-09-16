@@ -1,0 +1,46 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Standalone WAF Web ACL (AWS Managed SQL injection rule group) for use
+  with a CloudFront distribution. Must be deployed in us-east-1 — WAF
+  Web ACLs with Scope: CLOUDFRONT can only be created in that region,
+  regardless of where the CloudFront distribution's own stack lives.
+
+Parameters:
+  WebACLName:
+    Type: String
+    Description: Name for the WAF Web ACL.
+    Default: shopme-website-waf
+
+Resources:
+  WebsiteWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Ref WebACLName
+      Scope: CLOUDFRONT
+      Description: Web ACL with AWS Managed SQL injection protection
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${WebACLName}-metric"
+      Rules:
+        - Name: AWS-AWSManagedRulesSQLiRuleSet
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${WebACLName}-sqli-metric"
+
+Outputs:
+  WebACLArn:
+    Description: >
+      ARN of the WAF Web ACL. Pass this as the WebACLArn parameter
+      override when deploying the main shopme-s3-website.yaml stack.
+    Value: !GetAtt WebsiteWebACL.Arn

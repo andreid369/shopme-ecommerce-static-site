@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates an S3 bucket (with static website hosting enabled) and a
+  CloudFront distribution in front of it using Origin Access Control
+  (OAC), so the site is served via the CDN and the bucket itself is
+  not publicly accessible.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: >
+      Globally-unique name for the S3 bucket.
+    Default: shopme-website-123456789012
+    AllowedPattern: "^[a-z0-9.-]{3,63}$"
+    ConstraintDescription: >
+      Must be a valid S3 bucket name (lowercase letters, numbers, dots,
+      hyphens, 3-63 characters).
+
+Resources:
+
+  # ---------------------------------------------------------------------
+  # S3 bucket — static website hosting stays enabled, but the bucket
+  # itself is fully blocked from public access. CloudFront reaches it
+  # via OAC over the REST API endpoint, not the website endpoint
+  # (the website endpoint doesn't support SigV4, which OAC requires).
+  # ---------------------------------------------------------------------
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      Tags:
+        - Key: Project
+          Value: Shopme
+
+  # ---------------------------------------------------------------------
+  # Bucket policy: only allow reads from this specific CloudFront
+  # distribution (via OAC), nothing else.
+  # ---------------------------------------------------------------------
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${WebsiteBucket}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}"
+
+  # ---------------------------------------------------------------------
+  # Origin Access Control — lets CloudFront authenticate to S3 using
+  # SigV4, replacing the older Origin Access Identity (OAI) approach.
+  # ---------------------------------------------------------------------
+  WebsiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${BucketName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------
+  # CloudFront distribution
+  # ---------------------------------------------------------------------
+  WebsiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "CDN for ${BucketName}"
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt WebsiteOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          # Managed cache policy: CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Project
+          Value: Shopme
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket hosting the website content
+    Value: !Ref WebsiteBucket
+
+  S3WebsiteURL:
+    Description: >
+      Direct S3 static website endpoint (kept enabled, but no longer
+      publicly reachable now that public access is blocked — kept for
+      reference only).
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+
+  BucketDomainName:
+    Description: S3 bucket regional domain name (CloudFront origin)
+    Value: !GetAtt WebsiteBucket.RegionalDomainName
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref WebsiteDistribution
+
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name (this is your live site URL)
+    Value: !GetAtt WebsiteDistribution.DomainName
+
+  CloudFrontURL:
+    Description: Full HTTPS URL of the website via CloudFront
+    Value: !Sub "https://${WebsiteDistribution.DomainName}"
