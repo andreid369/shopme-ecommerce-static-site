@@ -45,7 +45,9 @@ plain parameter, avoids the region conflict entirely.
 - A **second CloudFront origin** pointed at that bucket, with its own OAC,
   routed via a `/images/*` path pattern — so `https://<your-domain>/images/foo.jpg`
   serves `foo.jpg` from the images bucket, not the website bucket
-- **S3 Transfer Acceleration** enabled on both buckets, for faster uploads
+- **S3 Transfer Acceleration** was evaluated but is **not enabled** —
+  unsupported in this stack's region (`eu-north-1`); see the dedicated
+  section below
 - **S3 Lifecycle rules** on the images bucket, transitioning objects to
   cheaper storage tiers as they age
 
@@ -62,40 +64,29 @@ plain parameter, avoids the region conflict entirely.
 > [aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing) if this
 > matters for your budget.
 
-## S3 Transfer Acceleration
+## S3 Transfer Acceleration — not available in this deployment
 
-Both the website bucket and the images bucket have
-`AccelerateConfiguration: {AccelerationStatus: Enabled}`. This routes
-uploads (`PUT`/`POST`) through the nearest CloudFront edge location on
-the way to the bucket, instead of over the public internet directly —
-which can meaningfully speed up uploads when you're pushing from
-somewhere geographically far from the bucket's AWS region (e.g. this
-project uploads from Romania to a bucket in `eu-north-1`).
+S3 Transfer Acceleration was initially added to both buckets, but AWS
+does **not support this feature for buckets in `eu-north-1` (Stockholm)**
+— it's one of several AWS "opt-in" regions excluded from Transfer
+Acceleration. Attempting to enable it causes a `405 Method Not Allowed`
+error during stack deployment.
 
-**This only affects uploads, not downloads.** Site visitors already get
-CDN speed via CloudFront regardless of this setting — Transfer
-Acceleration specifically helps whoever/whatever is *uploading* files
-(you, or the GitHub Actions workflow).
+As a result:
+- `AccelerateConfiguration` is **not** set on either bucket in
+  `shopme-s3-website.yaml`
+- The GitHub Actions workflow's `aws s3 sync` commands do **not** use
+  the `--endpoint-url https://s3-accelerate.amazonaws.com` flag
+- Uploads (manual or via CI/CD) go through the bucket's normal regional
+  endpoint
 
-The `.github/workflows/deploy.yml` sync steps already use the accelerate
-endpoint:
-```bash
-aws s3 sync ./site s3://<bucket> --endpoint-url https://s3-accelerate.amazonaws.com
-```
-
-If uploading manually instead, add the same `--endpoint-url` flag to your
-`aws s3 cp`/`sync` commands, or set `use_accelerate_endpoint = true` in
-your AWS CLI config to apply it by default.
-
-**Cost note:** accelerated transfers incur an additional per-GB charge on
-top of normal S3 pricing. Check current rates at
-[aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing) under
-"Transfer Acceleration" — for a small static site this is usually
-negligible, but worth knowing about.
-
-If acceleration is ever disabled on a bucket (by editing the template),
-remove the `--endpoint-url` flag from the workflow too — uploads through
-the accelerate endpoint fail once the bucket-side setting is off.
+If this stack is ever redeployed to a region that supports Transfer
+Acceleration, `AccelerateConfiguration: {AccelerationStatus: Enabled}`
+can be added back to the bucket resource(s), and the corresponding
+`--endpoint-url` flag added back to the workflow's sync steps. AWS
+periodically updates which regions support this feature — check
+[the current list](https://docs.aws.amazon.com/AmazonS3/latest/userguide/transfer-acceleration.html)
+before re-enabling.
 
 ## S3 Lifecycle rules (images bucket)
 
@@ -526,5 +517,5 @@ S3 bucket.
 | Product images show emoji instead of photos | No image file exists yet at that path in the images bucket — see "Sourcing product images" above. Confirm the filename in `site/images/` exactly matches what `index.html` references (case-sensitive) |
 | Images upload but still don't load on the site | Confirm they were uploaded under the `images/` key prefix (e.g. `images/product-1.jpg`), not the bucket root — the `/images/*` CloudFront path pattern forwards the full path, so the S3 key must include that prefix too |
 | GitHub Actions fails on the images sync step | Check the `IMAGES_BUCKET_NAME` secret is set and matches the real bucket name, and the CI IAM user's policy includes `s3:PutObject` / `s3:DeleteObject` / `s3:ListBucket` on that bucket too, not just the website bucket |
-| Upload fails with an endpoint/DNS-related error when using `--endpoint-url https://s3-accelerate.amazonaws.com` | Confirm `AccelerateConfiguration` is actually enabled on the target bucket — the accelerate endpoint rejects requests for buckets that don't have it turned on |
+| CloudFormation deploy fails with `405` on `WebsiteBucket` and/or `ImagesBucket` | S3 Transfer Acceleration was likely re-enabled on a bucket in `eu-north-1`, which doesn't support it — remove `AccelerateConfiguration` from the affected bucket(s) |
 | A product image that used to load now shows the emoji fallback | The image has likely transitioned to Glacier (180+ days old) and is no longer instantly retrievable — re-upload the image (which resets its age) if it should stay live, or leave it as expected behavior for a retired product |

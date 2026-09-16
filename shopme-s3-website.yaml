@@ -97,12 +97,10 @@ Resources:
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: index.html
-      # Speeds up uploads (e.g. from CI/CD) by routing them through the
-      # nearest CloudFront edge location to this bucket's region, instead
-      # of over the public internet directly. Note: this incurs an
-      # additional per-GB cost on accelerated transfers — see S3 pricing.
-      AccelerateConfiguration:
-        AccelerationStatus: Enabled
+      # Note: S3 Transfer Acceleration is NOT compatible with buckets
+      # that have static website hosting configured (AWS rejects it
+      # with a 405 error) — so acceleration is only enabled on the
+      # images bucket below, not this one.
       # Enables the AWS/S3 "AllRequests" (and other request) CloudWatch
       # metrics for this bucket — these are NOT published by default and
       # incur a small additional cost (S3 request metrics pricing).
@@ -163,12 +161,13 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      # Speeds up uploads (e.g. from CI/CD) by routing them through the
-      # nearest CloudFront edge location to this bucket's region, instead
-      # of over the public internet directly. Note: this incurs an
-      # additional per-GB cost on accelerated transfers — see S3 pricing.
-      AccelerateConfiguration:
-        AccelerationStatus: Enabled
+      # S3 Transfer Acceleration is NOT enabled here: this bucket is in
+      # eu-north-1 (Stockholm), an AWS "opt-in" region where Transfer
+      # Acceleration is unsupported (AWS excludes several opt-in
+      # regions from this feature). Attempting to enable it causes a
+      # 405 error during stack deployment. If this stack is ever
+      # redeployed to a supported region, AccelerateConfiguration:
+      # {AccelerationStatus: Enabled} can be added back here.
       # Automatically moves older product images to cheaper storage
       # tiers, since older/less-frequently-updated images are unlikely
       # to need frequent access at full S3 Standard pricing.
@@ -396,15 +395,3 @@ Outputs:
   ImagesBucketDomainName:
     Description: Images bucket regional domain name (CloudFront origin)
     Value: !GetAtt ImagesBucket.RegionalDomainName
-
-  WebsiteBucketAccelerateEndpoint:
-    Description: >
-      S3 Transfer Acceleration endpoint for the website bucket — use
-      this instead of the regular endpoint for faster uploads (e.g.
-      aws s3 cp --endpoint-url or the AWS CLI's use_accelerate_endpoint
-      config).
-    Value: !Sub "${BucketName}.s3-accelerate.amazonaws.com"
-
-  ImagesBucketAccelerateEndpoint:
-    Description: S3 Transfer Acceleration endpoint for the images bucket
-    Value: !Sub "${ImagesBucketName}.s3-accelerate.amazonaws.com"
