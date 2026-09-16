@@ -1,4 +1,4 @@
-# Deployment Guide — Shopme Static Website (S3 + CloudFront + OAC + WAF + Dashboard)
+# Deployment Guide — Shopme Static Website (S3 + CloudFront + OAC + WAF + Dashboard + CI/CD)
 
 This guide walks through deploying two CloudFormation stacks:
 
@@ -40,6 +40,11 @@ plain parameter, avoids the region conflict entirely.
 - An S3 bucket-level metrics configuration (`EntireBucket`), which is
   required to actually enable the `AllRequests` metric — S3 doesn't
   publish it by default
+- A **second S3 bucket** (default name `shopme-images-123456789012`),
+  fully private, dedicated to product images
+- A **second CloudFront origin** pointed at that bucket, with its own OAC,
+  routed via a `/images/*` path pattern — so `https://<your-domain>/images/foo.jpg`
+  serves `foo.jpg` from the images bucket, not the website bucket
 
 > **Note:** the S3 website-hosting feature (index/error document config)
 > stays enabled on the bucket, but it's no longer the way visitors reach
@@ -54,14 +59,38 @@ plain parameter, avoids the region conflict entirely.
 > [aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing) if this
 > matters for your budget.
 
+## Repository structure
+
+```
+.
+├── site/                       # Everything here gets deployed to S3 — and only this
+│   ├── index.html
+│   └── images/                 # Product images — synced to the IMAGES bucket, not the website bucket
+│       ├── product-1.jpg
+│       ├── product-2.jpg
+│       └── ...
+├── shopme-waf.yaml
+├── shopme-s3-website.yaml
+├── deployment.md
+├── custom-domain-setup.md
+└── .github/
+    └── workflows/
+        └── deploy.yml           # GitHub Actions CI/CD — see "Continuous deployment" below
+```
+
+Keeping site content inside `site/` (rather than the repo root) means the
+GitHub Actions workflow can sync that one folder to S3 without needing to
+individually exclude every infra/docs file — anything outside `site/`
+simply never gets deployed.
+
 ## Prerequisites
 
 - An AWS account
 - [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) installed and configured (`aws configure`) with credentials that have permission to create S3 buckets, bucket policies, CloudFront distributions, WAF Web ACLs, and CloudFormation stacks
-- The three files from this project in the same folder:
+- The following from this project, following the repository structure above:
   - `shopme-waf.yaml`
   - `shopme-s3-website.yaml`
-  - `index.html`
+  - `site/index.html`
 
 ## Step 1 — Choose a bucket name
 
@@ -153,13 +182,16 @@ aws configure get region
 
 (assuming you haven't been overriding it with `--region` on prior deploys).
 
-## Step 5 — Upload the website file to the bucket
+## Step 5 — Upload the website file to the bucket (manual method)
 
 ```bash
-aws s3 cp index.html s3://shopme-website-123456789012/index.html --content-type text/html
+aws s3 cp site/index.html s3://shopme-website-123456789012/index.html --content-type text/html
 ```
 
-Re-run this command any time you update `index.html` to push a new version.
+Re-run this command any time you update `site/index.html` to push a new
+version manually. **If you've set up the GitHub Actions workflow (see
+"Continuous deployment" below), you don't need to run this manually** —
+pushing to `main` does it automatically.
 
 ## Step 6 — Get the CloudFront URL
 
@@ -223,9 +255,120 @@ If you're pointing a domain like `shop.yourdomain.com` at this distribution,
 see the separate `custom-domain-setup.md` guide for the ACM certificate and
 DNS record steps.
 
+## Continuous deployment with GitHub Actions
+
+Instead of manually running `aws s3 cp` every time, `.github/workflows/deploy.yml`
+automatically syncs `site/` to the website bucket, syncs `site/images/` to
+the images bucket, and invalidates the CloudFront cache — all on every
+push to `main` (or manually via the Actions tab, using `workflow_dispatch`).
+
+**What it does:**
+1. Checks out the repo
+2. Configures AWS credentials from GitHub Secrets
+3. Runs `aws s3 sync ./site s3://<website-bucket> --delete --exclude "images/*"`
+   — uploads site files (HTML, etc.), explicitly skipping the `images/`
+   subfolder so images don't get duplicated into the website bucket
+4. Runs `aws s3 sync ./site/images s3://<images-bucket>/images --delete`
+   — uploads product images to the dedicated images bucket, under the
+   `images/` key prefix (required so the `/images/*` CloudFront path
+   pattern resolves to the right S3 keys)
+5. Runs `aws cloudfront create-invalidation --paths "/*"` — so visitors
+   see the new content immediately instead of a cached copy
+
+### One-time setup
+
+1. **Create a dedicated IAM user for CI/CD** (don't reuse your personal
+   credentials). Attach a policy scoped to just what's needed:
+   - `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket` on **both** buckets
+     (website and images)
+   - `cloudfront:CreateInvalidation` on your distribution
+
+   Generate an access key for this user.
+
+2. **Add these as GitHub repository secrets**
+   (repo → **Settings → Secrets and variables → Actions → New repository secret**):
+
+   | Secret name | Example value |
+   |---|---|
+   | `AWS_ACCESS_KEY_ID` | from the CI IAM user |
+   | `AWS_SECRET_ACCESS_KEY` | from the CI IAM user |
+   | `AWS_REGION` | `eu-north-1` |
+   | `S3_BUCKET_NAME` | `shopme-website-123456789012` |
+   | `IMAGES_BUCKET_NAME` | `shopme-images-123456789012` |
+   | `CLOUDFRONT_DISTRIBUTION_ID` | `E2D646JE7JDDMQ` |
+
+3. **Make sure the repo structure matches** the layout above — product
+   images go in `site/images/`, named to match what `index.html`
+   references (e.g. `product-1.jpg` through `product-24.jpg`). See
+   "Sourcing product images" below for where to get these.
+
+4. **Push to `main`** — either by committing a real change, or triggering
+   it manually from the **Actions** tab (`workflow_dispatch` is already
+   enabled in `deploy.yml`). Watch the run logs to confirm all three
+   steps succeed.
+
+### Sourcing product images
+
+`index.html` references images at `/images/product-<id>.jpg` for products
+1 through 24, but no actual image files exist yet — the site falls back
+to an emoji icon per product until you add them.
+
+Use a free-license stock photo site — **no copyright risk, no attribution
+required**:
+- [Unsplash](https://unsplash.com) — Unsplash License
+- [Pexels](https://pexels.com) — Pexels License
+
+Search for each product (search terms below), download a photo you like,
+and save it into `site/images/` using the exact filename listed — this
+must match what `index.html` expects.
+
+| id | Product | Search term | Save as |
+|----|---------|-------------|---------|
+| 1 | Wireless Headphones | wireless headphones | `product-1.jpg` |
+| 2 | Smart Fitness Watch | smart watch | `product-2.jpg` |
+| 3 | 4K Streaming Media Player | streaming device tv | `product-3.jpg` |
+| 4 | Portable Bluetooth Speaker | bluetooth speaker | `product-4.jpg` |
+| 5 | French Press Coffee Maker | french press coffee | `product-5.jpg` |
+| 6 | Non-Stick Cookware Set | cookware set pots pans | `product-6.jpg` |
+| 7 | Memory Foam Pillow | pillow bedroom | `product-7.jpg` |
+| 8 | Robot Vacuum Cleaner | robot vacuum | `product-8.jpg` |
+| 9 | Novel (book) | book novel | `product-9.jpg` |
+| 10 | Self-help Book | self help book | `product-10.jpg` |
+| 11 | Cooking Guide Book | cookbook | `product-11.jpg` |
+| 12 | Men's Cotton T-Shirt | mens t-shirt | `product-12.jpg` |
+| 13 | Women's Running Shoes | running shoes | `product-13.jpg` |
+| 14 | Polarized Sunglasses | sunglasses | `product-14.jpg` |
+| 15 | Leather Jacket | leather jacket | `product-15.jpg` |
+| 16 | Yoga Mat | yoga mat | `product-16.jpg` |
+| 17 | Camping Tent | camping tent | `product-17.jpg` |
+| 18 | Adjustable Dumbbell Set | dumbbells | `product-18.jpg` |
+| 19 | Insulated Water Bottle | water bottle | `product-19.jpg` |
+| 20 | Moisturizing Face Cream | face cream skincare | `product-20.jpg` |
+| 21 | Professional Hair Dryer | hair dryer | `product-21.jpg` |
+| 22 | Building Blocks Toy Set | building blocks toy | `product-22.jpg` |
+| 23 | RC Racing Car | remote control car toy | `product-23.jpg` |
+| 24 | Mechanical Gaming Keyboard | gaming keyboard | `product-24.jpg` |
+
+Once added, commit and push — the workflow uploads them to the images
+bucket automatically on the next run.
+
+### Security note
+
+This setup uses long-lived AWS access keys stored as GitHub Secrets — fine
+for a bootcamp/learning project, but for production use, AWS recommends
+**OIDC (OpenID Connect)** instead: GitHub Actions assumes a temporary IAM
+role with no stored keys at all. That requires a bit more setup (an IAM
+identity provider + trust policy) but removes the risk of a leaked or
+stale long-lived key entirely.
+
 ## Updating the site later
 
-1. Re-run the Step 5 upload command to push the new `index.html` to S3.
+**With the GitHub Actions workflow set up:** just commit your change to
+`site/index.html` and push to `main` — the sync and cache invalidation
+happen automatically.
+
+**Manually (without CI/CD):**
+1. Re-run the Step 5 upload command to push the new `site/index.html` to S3.
 2. **Invalidate the CloudFront cache** so visitors see the update immediately,
    instead of waiting for the cached version to expire:
 
@@ -301,3 +444,11 @@ S3 bucket.
 | CloudFront Requests widget is empty | Confirm the dashboard widget is querying `us-east-1` — CloudFront metrics always publish there. Also allow a few minutes after deploy/traffic for data to appear |
 | S3 AllRequests widget is empty | Confirm `MetricsConfigurations` with `Id: EntireBucket` is present on the bucket (it enables the metric) and that some requests have actually hit the bucket recently — allow up to ~15 minutes for the first data points |
 | Dashboard resource fails to create/update | Check `DashboardBody` is valid JSON — a stray comma or unescaped `${...}` reference is the most common cause. CloudFormation will report the exact JSON parse error in the stack events |
+| GitHub Actions workflow fails at "Configure AWS credentials" | One or more of `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_REGION` secrets is missing or misspelled — check **Settings → Secrets and variables → Actions** |
+| GitHub Actions workflow fails at "Sync website files to S3" with AccessDenied | The CI IAM user's policy doesn't include `s3:PutObject` / `s3:DeleteObject` / `s3:ListBucket` on the bucket, or `S3_BUCKET_NAME` secret doesn't match the real bucket name |
+| GitHub Actions workflow fails at "Invalidate CloudFront cache" | The CI IAM user is missing `cloudfront:CreateInvalidation`, or `CLOUDFRONT_DISTRIBUTION_ID` secret is wrong |
+| Workflow runs but site doesn't update | Confirm `site/index.html` (not a root-level `index.html`) was actually changed and committed — the workflow only syncs the `site/` folder |
+| Workflow doesn't trigger at all | Confirm `deploy.yml` is at exactly `.github/workflows/deploy.yml` and you pushed to the `main` branch specifically |
+| Product images show emoji instead of photos | No image file exists yet at that path in the images bucket — see "Sourcing product images" above. Confirm the filename in `site/images/` exactly matches what `index.html` references (case-sensitive) |
+| Images upload but still don't load on the site | Confirm they were uploaded under the `images/` key prefix (e.g. `images/product-1.jpg`), not the bucket root — the `/images/*` CloudFront path pattern forwards the full path, so the S3 key must include that prefix too |
+| GitHub Actions fails on the images sync step | Check the `IMAGES_BUCKET_NAME` secret is set and matches the real bucket name, and the CI IAM user's policy includes `s3:PutObject` / `s3:DeleteObject` / `s3:ListBucket` on that bucket too, not just the website bucket |

@@ -24,9 +24,15 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Sync website files to S3
+      - name: Sync website files to S3 (excluding images/)
         run: |
           aws s3 sync ./site s3://${{ secrets.S3_BUCKET_NAME }} \
+            --delete \
+            --exclude "images/*"
+
+      - name: Sync product images to the images bucket
+        run: |
+          aws s3 sync ./site/images s3://${{ secrets.IMAGES_BUCKET_NAME }}/images \
             --delete
 
       - name: Invalidate CloudFront cache

@@ -3,10 +3,13 @@ Description: >
   Creates an S3 bucket (with static website hosting enabled) and a
   CloudFront distribution in front of it using Origin Access Control
   (OAC), so the site is served via the CDN and the bucket itself is
-  not publicly accessible. Optionally attaches an existing WAF Web ACL
-  (created separately via shopme-waf.yaml in us-east-1) for SQL
-  injection protection, a custom domain with ACM certificate, and a
-  CloudWatch dashboard for CloudFront Requests and S3 AllRequests.
+  not publicly accessible. Also creates a separate, fully private S3
+  bucket for product images, added to the distribution as a second
+  origin with its own OAC and routed via a /images/* path pattern.
+  Optionally attaches an existing WAF Web ACL (created separately via
+  shopme-waf.yaml in us-east-1) for SQL injection protection, a custom
+  domain with ACM certificate, and a CloudWatch dashboard for
+  CloudFront Requests and S3 AllRequests.
 
 Parameters:
   BucketName:
@@ -54,6 +57,16 @@ Parameters:
       ARN of the ACM certificate (must be issued in us-east-1) covering
       DomainName. Required if DomainName is set.
     Default: ""
+
+  ImagesBucketName:
+    Type: String
+    Description: >
+      Globally-unique name for the S3 bucket that stores product images.
+    Default: shopme-images-123456789012
+    AllowedPattern: "^[a-z0-9.-]{3,63}$"
+    ConstraintDescription: >
+      Must be a valid S3 bucket name (lowercase letters, numbers, dots,
+      hyphens, 3-63 characters).
 
 Conditions:
   CreateWAF: !Equals [!Ref EnableWAF, "true"]
@@ -126,6 +139,61 @@ Resources:
         SigningProtocol: sigv4
 
   # ---------------------------------------------------------------------
+  # Images bucket — dedicated to product images, fully private. Reached
+  # only via CloudFront (through the /images/* path pattern) using its
+  # own OAC, same pattern as the website bucket.
+  # ---------------------------------------------------------------------
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref ImagesBucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: Shopme
+
+  # ---------------------------------------------------------------------
+  # Bucket policy: only allow reads from this specific CloudFront
+  # distribution (via OAC), nothing else.
+  # ---------------------------------------------------------------------
+  ImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImagesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:aws:s3:::${ImagesBucket}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebsiteDistribution}"
+
+  # ---------------------------------------------------------------------
+  # Separate OAC for the images bucket — each S3 origin on a
+  # distribution should have its own OAC.
+  # ---------------------------------------------------------------------
+  ImagesOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ImagesBucketName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------
   # Note: the WAF Web ACL is NOT created here. WAF Web ACLs with
   # Scope: CLOUDFRONT must be created in us-east-1, which may differ
   # from this stack's own region. Deploy shopme-waf.yaml to us-east-1
@@ -159,6 +227,11 @@ Resources:
             OriginAccessControlId: !GetAtt WebsiteOAC.Id
             S3OriginConfig:
               OriginAccessIdentity: ""
+          - Id: ImagesOrigin
+            DomainName: !GetAtt ImagesBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt ImagesOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
         DefaultCacheBehavior:
           TargetOriginId: S3Origin
           ViewerProtocolPolicy: redirect-to-https
@@ -171,6 +244,19 @@ Resources:
           Compress: true
           # Managed cache policy: CachingOptimized
           CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CacheBehaviors:
+          - PathPattern: "/images/*"
+            TargetOriginId: ImagesOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            # Managed cache policy: CachingOptimized
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
         CustomErrorResponses:
           - ErrorCode: 403
             ResponseCode: 200
@@ -276,3 +362,11 @@ Outputs:
     Description: Full HTTPS URL of the website via the custom domain (blank if DomainName is not set)
     Condition: HasCustomDomain
     Value: !Sub "https://${DomainName}"
+
+  ImagesBucketName:
+    Description: Name of the S3 bucket storing product images
+    Value: !Ref ImagesBucket
+
+  ImagesBucketDomainName:
+    Description: Images bucket regional domain name (CloudFront origin)
+    Value: !GetAtt ImagesBucket.RegionalDomainName
