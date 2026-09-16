@@ -28,12 +28,14 @@ jobs:
         run: |
           aws s3 sync ./site s3://${{ secrets.S3_BUCKET_NAME }} \
             --delete \
-            --exclude "images/*"
+            --exclude "images/*" \
+            --endpoint-url https://s3-accelerate.amazonaws.com
 
       - name: Sync product images to the images bucket
         run: |
           aws s3 sync ./site/images s3://${{ secrets.IMAGES_BUCKET_NAME }}/images \
-            --delete
+            --delete \
+            --endpoint-url https://s3-accelerate.amazonaws.com
 
       - name: Invalidate CloudFront cache
         run: |

@@ -45,6 +45,9 @@ plain parameter, avoids the region conflict entirely.
 - A **second CloudFront origin** pointed at that bucket, with its own OAC,
   routed via a `/images/*` path pattern — so `https://<your-domain>/images/foo.jpg`
   serves `foo.jpg` from the images bucket, not the website bucket
+- **S3 Transfer Acceleration** enabled on both buckets, for faster uploads
+- **S3 Lifecycle rules** on the images bucket, transitioning objects to
+  cheaper storage tiers as they age
 
 > **Note:** the S3 website-hosting feature (index/error document config)
 > stays enabled on the bucket, but it's no longer the way visitors reach
@@ -58,6 +61,77 @@ plain parameter, avoids the region conflict entirely.
 > from normal storage/transfer charges). Check current pricing at
 > [aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing) if this
 > matters for your budget.
+
+## S3 Transfer Acceleration
+
+Both the website bucket and the images bucket have
+`AccelerateConfiguration: {AccelerationStatus: Enabled}`. This routes
+uploads (`PUT`/`POST`) through the nearest CloudFront edge location on
+the way to the bucket, instead of over the public internet directly —
+which can meaningfully speed up uploads when you're pushing from
+somewhere geographically far from the bucket's AWS region (e.g. this
+project uploads from Romania to a bucket in `eu-north-1`).
+
+**This only affects uploads, not downloads.** Site visitors already get
+CDN speed via CloudFront regardless of this setting — Transfer
+Acceleration specifically helps whoever/whatever is *uploading* files
+(you, or the GitHub Actions workflow).
+
+The `.github/workflows/deploy.yml` sync steps already use the accelerate
+endpoint:
+```bash
+aws s3 sync ./site s3://<bucket> --endpoint-url https://s3-accelerate.amazonaws.com
+```
+
+If uploading manually instead, add the same `--endpoint-url` flag to your
+`aws s3 cp`/`sync` commands, or set `use_accelerate_endpoint = true` in
+your AWS CLI config to apply it by default.
+
+**Cost note:** accelerated transfers incur an additional per-GB charge on
+top of normal S3 pricing. Check current rates at
+[aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing) under
+"Transfer Acceleration" — for a small static site this is usually
+negligible, but worth knowing about.
+
+If acceleration is ever disabled on a bucket (by editing the template),
+remove the `--endpoint-url` flag from the workflow too — uploads through
+the accelerate endpoint fail once the bucket-side setting is off.
+
+## S3 Lifecycle rules (images bucket)
+
+The images bucket has a lifecycle rule that automatically moves objects
+to cheaper storage tiers as they age, since older/less-frequently-updated
+product images don't need to sit on full-price S3 Standard indefinitely:
+
+| Object age | Transitions to |
+|---|---|
+| 60 days | S3 Standard-IA (Infrequent Access) |
+| 180 days | S3 Glacier |
+
+**Important — Glacier means retrieval delay.** Once an object transitions
+to Glacier, it is **not instantly accessible**. Retrieving it requires an
+explicit restore request that can take anywhere from minutes to several
+hours depending on retrieval speed tier. If CloudFront tries to serve an
+image straight from Glacier, it will fail — visitors will see a broken
+image (the site's emoji fallback will kick in instead, so the page won't
+visually break, but the real photo won't load).
+
+**What this means in practice:**
+- Fine for images you genuinely expect to go "cold" — discontinued
+  products, seasonal items, anything unlikely to need live serving after
+  ~6 months
+- **Risky for any image still actively referenced on the live site** —
+  if a product stays listed past 180 days without its image being
+  re-uploaded (which resets the age), that image will silently stop
+  loading
+- Periodically check which images are approaching 180 days old, and
+  either refresh (re-upload) images for products still active, or accept
+  the broken-image fallback for genuinely retired products
+
+Standard-IA (the 60-day step) does **not** have this retrieval delay —
+objects there remain instantly accessible, just at a different storage
+price point with a per-GB retrieval fee. Only the Glacier step (180 days)
+introduces the delay.
 
 ## Repository structure
 
@@ -452,3 +526,5 @@ S3 bucket.
 | Product images show emoji instead of photos | No image file exists yet at that path in the images bucket — see "Sourcing product images" above. Confirm the filename in `site/images/` exactly matches what `index.html` references (case-sensitive) |
 | Images upload but still don't load on the site | Confirm they were uploaded under the `images/` key prefix (e.g. `images/product-1.jpg`), not the bucket root — the `/images/*` CloudFront path pattern forwards the full path, so the S3 key must include that prefix too |
 | GitHub Actions fails on the images sync step | Check the `IMAGES_BUCKET_NAME` secret is set and matches the real bucket name, and the CI IAM user's policy includes `s3:PutObject` / `s3:DeleteObject` / `s3:ListBucket` on that bucket too, not just the website bucket |
+| Upload fails with an endpoint/DNS-related error when using `--endpoint-url https://s3-accelerate.amazonaws.com` | Confirm `AccelerateConfiguration` is actually enabled on the target bucket — the accelerate endpoint rejects requests for buckets that don't have it turned on |
+| A product image that used to load now shows the emoji fallback | The image has likely transitioned to Glacier (180+ days old) and is no longer instantly retrievable — re-upload the image (which resets its age) if it should stay live, or leave it as expected behavior for a retired product |
