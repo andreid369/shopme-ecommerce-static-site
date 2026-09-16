@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Creates destination S3 buckets in a secondary region for Cross-Region
+  Replication (disaster recovery) from the Shopme website and images
+  buckets. Deploy this stack to your chosen DR region (e.g. eu-west-1) —
+  separately from the main shopme-s3-website.yaml stack, which can live
+  in a different region. Versioning is enabled on both buckets, as
+  required for replication.
+
+Parameters:
+  DRWebsiteBucketName:
+    Type: String
+    Description: >
+      Globally-unique name for the DR destination bucket mirroring the
+      website bucket.
+    Default: shopme-website-123456789012-dr
+    AllowedPattern: "^[a-z0-9.-]{3,63}$"
+    ConstraintDescription: >
+      Must be a valid S3 bucket name (lowercase letters, numbers, dots,
+      hyphens, 3-63 characters).
+
+  DRImagesBucketName:
+    Type: String
+    Description: >
+      Globally-unique name for the DR destination bucket mirroring the
+      images bucket.
+    Default: shopme-images-123456789012-dr
+    AllowedPattern: "^[a-z0-9.-]{3,63}$"
+    ConstraintDescription: >
+      Must be a valid S3 bucket name (lowercase letters, numbers, dots,
+      hyphens, 3-63 characters).
+
+Resources:
+
+  DRWebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DRWebsiteBucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: Shopme
+        - Key: Purpose
+          Value: DisasterRecovery
+
+  DRImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref DRImagesBucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: Shopme
+        - Key: Purpose
+          Value: DisasterRecovery
+
+Outputs:
+  DRWebsiteBucketArn:
+    Description: >
+      ARN of the DR website bucket. Pass this as the
+      DestinationWebsiteBucketArn parameter when deploying the main
+      shopme-s3-website.yaml stack.
+    Value: !GetAtt DRWebsiteBucket.Arn
+
+  DRImagesBucketArn:
+    Description: >
+      ARN of the DR images bucket. Pass this as the
+      DestinationImagesBucketArn parameter when deploying the main
+      shopme-s3-website.yaml stack.
+    Value: !GetAtt DRImagesBucket.Arn
+
+  DRWebsiteBucketName:
+    Description: Name of the DR website bucket
+    Value: !Ref DRWebsiteBucket
+
+  DRImagesBucketName:
+    Description: Name of the DR images bucket
+    Value: !Ref DRImagesBucket

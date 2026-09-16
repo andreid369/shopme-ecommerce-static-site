@@ -1,14 +1,18 @@
-# Deployment Guide — Shopme Static Website (S3 + CloudFront + OAC + WAF + Dashboard + CI/CD)
+# Deployment Guide — Shopme Static Website (S3 + CloudFront + OAC + WAF + Dashboard + CI/CD + DR Replication)
 
-This guide walks through deploying two CloudFormation stacks:
+This guide walks through deploying three CloudFormation stacks:
 
 1. **`shopme-waf.yaml`** — a standalone WAF Web ACL, which must be deployed
    in **us-east-1**
-2. **`shopme-s3-website.yaml`** — the main stack (S3 bucket + CloudFront +
+2. **`shopme-dr.yaml`** — standalone disaster-recovery destination buckets,
+   deployed in a **secondary region** (e.g. `eu-west-1`) — only needed if
+   you want Cross-Region Replication
+3. **`shopme-s3-website.yaml`** — the main stack (S3 buckets + CloudFront +
    OAC), deployed in **your normal region** (e.g. `eu-north-1`), which
-   optionally attaches the WAF Web ACL from step 1
+   optionally attaches the WAF Web ACL from step 1 and optionally
+   replicates to the DR buckets from step 2
 
-## Why two stacks?
+## Why multiple stacks?
 
 WAF Web ACLs with `Scope: CLOUDFRONT` can only be **created** via the
 us-east-1 API endpoint — this is a hard AWS requirement, unrelated to where
@@ -18,11 +22,24 @@ create a `Scope: CLOUDFRONT` Web ACL inside that same stack. Splitting it
 into its own us-east-1 stack, and passing its ARN into the main stack as a
 plain parameter, avoids the region conflict entirely.
 
+The same logic applies to disaster recovery: an S3 bucket always lives in
+whichever region its own CloudFormation stack deploys to — there's no way
+to create a bucket "in a different region" from within a single stack.
+So the DR destination buckets get their own small stack, deployed to
+whatever secondary region you choose, and the main stack references their
+ARNs as plain parameters rather than creating them directly.
+
 ## What each template creates
 
 **`shopme-waf.yaml`** (deploy to us-east-1):
 - An AWS WAF Web ACL with the AWS Managed Rule Group `AWSManagedRulesSQLiRuleSet`
   (SQL injection protection)
+
+**`shopme-dr.yaml`** (deploy to a secondary region, e.g. eu-west-1) — only
+needed if using replication:
+- `DRWebsiteBucket`, `DRImagesBucket` — private, versioned destination
+  buckets mirroring the two source buckets, using `BucketOwnerEnforced`
+  ownership (simplest model for replication, avoids ACL complications)
 
 **`shopme-s3-website.yaml`** (deploy to your normal region):
 - An S3 bucket (default name `shopme-website-123456789012`) with static
@@ -50,6 +67,10 @@ plain parameter, avoids the region conflict entirely.
   section below
 - **S3 Lifecycle rules** on the images bucket, transitioning objects to
   cheaper storage tiers as they age
+- **Versioning** enabled on both source buckets (required for replication)
+- **(Optional, off by default)** S3 Cross-Region Replication from both
+  source buckets to the DR buckets from `shopme-dr.yaml`, via a dedicated
+  IAM role — see the dedicated section below
 
 > **Note:** the S3 website-hosting feature (index/error document config)
 > stays enabled on the bucket, but it's no longer the way visitors reach
@@ -123,6 +144,58 @@ Standard-IA (the 60-day step) does **not** have this retrieval delay —
 objects there remain instantly accessible, just at a different storage
 price point with a per-GB retrieval fee. Only the Glacier step (180 days)
 introduces the delay.
+
+## Disaster recovery — S3 Cross-Region Replication (optional)
+
+Both source buckets can replicate every object to a secondary region for
+disaster recovery, controlled by the `EnableReplication` parameter on
+the main stack (default `"false"`).
+
+**What gets created when enabled:**
+- Versioning on both source buckets (`WebsiteBucket`, `ImagesBucket`) —
+  this is **always on**, regardless of `EnableReplication`, since it's
+  required infrastructure for replication and good practice generally
+- A dedicated `ReplicationRole` IAM role, scoped to read from the two
+  source buckets and write to the two destination buckets — nothing
+  broader
+- A `ReplicationConfiguration` on each source bucket, replicating **all**
+  objects (no prefix filter) to its corresponding DR bucket
+
+**Storage class handling:** the replication rules don't specify an
+override `StorageClass` in the `Destination` block, so replicated objects
+land in the DR bucket at whatever storage class they currently have on
+the source at the moment of replication (satisfies "replicate objects
+including their storage class").
+
+**Important — this does NOT keep replicas in sync with later lifecycle
+transitions.** If an object on the source images bucket later transitions
+from S3 Standard to Standard-IA or Glacier (via the Lifecycle rule
+above), that transition is **not** automatically mirrored to the DR
+copy — S3 Cross-Region Replication replicates the object as it exists at
+replication time, not ongoing storage-class changes made afterward by a
+separate lifecycle rule. The DR buckets in `shopme-dr.yaml` intentionally
+have **no lifecycle rules of their own** in this setup, so replicated
+objects stay in DR at whatever class they arrived in — they will not
+independently transition to IA/Glacier over time in the DR region. If you
+want the DR bucket's storage costs and tiering to mirror the source
+bucket's long-term behavior, matching lifecycle rules would need to be
+added to `shopme-dr.yaml` separately — deliberately left out of this
+setup.
+
+**Deploy order:**
+1. Deploy `shopme-dr.yaml` to your chosen secondary region first (e.g.
+   `eu-west-1`) — see Step 3a below
+2. Copy its `DRWebsiteBucketArn` and `DRImagesBucketArn` outputs
+3. Deploy/update the main stack with `EnableReplication=true` and those
+   two ARNs passed in as `DestinationWebsiteBucketArn` /
+   `DestinationImagesBucketArn`
+
+**Cost note:** Cross-Region Replication incurs storage costs in the DR
+region (a full second copy of your data) plus inter-region data transfer
+charges for every replicated object. For a small static site this is
+usually modest, but it's an ongoing cost that scales with how much you
+store — check current rates at
+[aws.amazon.com/s3/pricing](https://aws.amazon.com/s3/pricing).
 
 ## Repository structure
 
@@ -202,34 +275,90 @@ aws cloudformation describe-stacks \
 
 Copy that ARN — you'll pass it into the main stack next.
 
+## Step 3a — Deploy the DR stack (secondary region) — skip if not using replication
+
+```bash
+aws cloudformation deploy \
+  --template-file shopme-dr.yaml \
+  --stack-name shopme-dr \
+  --region eu-west-1
+```
+
+(Use whichever secondary region you want for disaster recovery — `eu-west-1`
+is just this project's example choice. Avoid picking the same region as
+your main stack, and avoid opt-in regions if you might later want features
+like Transfer Acceleration there too.)
+
+Then retrieve both destination bucket ARNs:
+
+```bash
+aws cloudformation describe-stacks \
+  --stack-name shopme-dr \
+  --region eu-west-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='DRWebsiteBucketArn'].OutputValue" \
+  --output text
+
+aws cloudformation describe-stacks \
+  --stack-name shopme-dr \
+  --region eu-west-1 \
+  --query "Stacks[0].Outputs[?OutputKey=='DRImagesBucketArn'].OutputValue" \
+  --output text
+```
+
+Copy both ARNs — you'll pass them into the main stack next.
+
 ## Step 4 — Deploy (or update) the main stack
 
 Replace `<your-region>` with wherever this stack normally lives (this
-project uses `eu-north-1`), and `<arn-from-step-3>` with the value you just
-copied.
+project uses `eu-north-1`), `<arn-from-step-3>` with the WAF ARN, and
+`<website-dr-arn>` / `<images-dr-arn>` with the two ARNs from Step 3a.
 
-**With WAF enabled:**
+**With WAF and replication both enabled:**
 ```bash
 aws cloudformation deploy \
   --template-file shopme-s3-website.yaml \
   --stack-name shopme-website \
-  --parameter-overrides BucketName=shopme-website-123456789012 WebACLArn=<arn-from-step-3> \
-  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+      BucketName=shopme-website-123456789012 \
+      ImagesBucketName=shopme-images-123456789012 \
+      WebACLArn=<arn-from-step-3> \
+      EnableReplication=true \
+      DestinationWebsiteBucketArn=<website-dr-arn> \
+      DestinationImagesBucketArn=<images-dr-arn> \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --region <your-region>
 ```
 
-**Without WAF:**
+**With neither WAF nor replication:**
 ```bash
 aws cloudformation deploy \
   --template-file shopme-s3-website.yaml \
   --stack-name shopme-website \
   --parameter-overrides BucketName=shopme-website-123456789012 EnableWAF=false \
-  --capabilities CAPABILITY_IAM \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
   --region <your-region>
 ```
 
+**Why `CAPABILITY_NAMED_IAM`:** the `ReplicationRole` (created only when
+`EnableReplication=true`) has an explicit `RoleName` rather than letting
+CloudFormation auto-generate one. Any template that names an IAM resource
+explicitly requires `CAPABILITY_NAMED_IAM` in addition to the usual
+`CAPABILITY_IAM` — otherwise the deploy fails with
+`InsufficientCapabilitiesException`. Both example commands above include
+it so you can copy-paste either one safely regardless of whether
+replication is enabled in that particular deploy.
+
+Mix and match `EnableWAF` / `EnableReplication` independently depending on
+which features you want active — each has its own toggle and its own
+required parameters (see "What each template creates" above for exactly
+which parameters pair with which toggle).
+
 If you already have the `shopme-website` stack from a previous deployment,
 this same command **updates it in place** — no need to delete and recreate.
+**Remember:** every `deploy` call must include every parameter you want to
+keep, not just the one you're changing — CloudFormation replaces the full
+parameter set with whatever's in this specific command, falling back to
+template defaults for anything omitted.
 
 Deployment (or update) typically takes a few minutes; CloudFront distribution
 changes themselves can take 5–15 minutes to fully propagate globally.
@@ -478,14 +607,40 @@ CloudFront distributions must be **disabled** before they can be deleted,
 and CloudFormation handles this automatically on stack deletion — but it
 can take several minutes.
 
+**Important — versioning changes bucket emptying.** Now that versioning
+is enabled on both source buckets, `aws s3 rm --recursive` only removes
+the *current* version of each object — old versions and delete markers
+remain, and CloudFormation will refuse to delete a bucket that isn't
+**completely** empty (all versions included). Empty each versioned
+bucket properly first:
+
 ```bash
-aws s3 rm s3://shopme-website-123456789012 --recursive
+# Repeat for both shopme-website-123456789012 and shopme-images-123456789012
+BUCKET=shopme-website-123456789012
+
+aws s3api delete-objects --bucket $BUCKET --delete "$(aws s3api list-object-versions \
+  --bucket $BUCKET --output json \
+  --query '{Objects: Versions[].{Key:Key,VersionId:VersionId}}')"
+
+aws s3api delete-objects --bucket $BUCKET --delete "$(aws s3api list-object-versions \
+  --bucket $BUCKET --output json \
+  --query '{Objects: DeleteMarkers[].{Key:Key,VersionId:VersionId}}')"
+```
+
+Then delete the stacks:
+
+```bash
 aws cloudformation delete-stack --stack-name shopme-website --region <your-region>
 aws cloudformation wait stack-delete-complete --stack-name shopme-website --region <your-region>
 
 # If you also want to remove the WAF Web ACL:
 aws cloudformation delete-stack --stack-name shopme-waf --region us-east-1
 aws cloudformation wait stack-delete-complete --stack-name shopme-waf --region us-east-1
+
+# If you also deployed the DR stack, empty its two versioned buckets the
+# same way as above first, then:
+aws cloudformation delete-stack --stack-name shopme-dr --region eu-west-1
+aws cloudformation wait stack-delete-complete --stack-name shopme-dr --region eu-west-1
 ```
 
 The bucket must be emptied first — CloudFormation won't delete a non-empty
@@ -519,3 +674,10 @@ S3 bucket.
 | GitHub Actions fails on the images sync step | Check the `IMAGES_BUCKET_NAME` secret is set and matches the real bucket name, and the CI IAM user's policy includes `s3:PutObject` / `s3:DeleteObject` / `s3:ListBucket` on that bucket too, not just the website bucket |
 | CloudFormation deploy fails with `405` on `WebsiteBucket` and/or `ImagesBucket` | S3 Transfer Acceleration was likely re-enabled on a bucket in `eu-north-1`, which doesn't support it — remove `AccelerateConfiguration` from the affected bucket(s) |
 | A product image that used to load now shows the emoji fallback | The image has likely transitioned to Glacier (180+ days old) and is no longer instantly retrievable — re-upload the image (which resets its age) if it should stay live, or leave it as expected behavior for a retired product |
+| Main stack fails with an invalid/missing `DestinationWebsiteBucketArn` or `DestinationImagesBucketArn` | Make sure `EnableReplication=true` is paired with real ARN values from the `shopme-dr` stack's outputs — deploy `shopme-dr.yaml` first (Step 3a) if you haven't |
+| `shopme-dr.yaml` fails with `BucketAlreadyExists` | The DR bucket name is already taken globally — choose a different `DRWebsiteBucketName`/`DRImagesBucketName` |
+| Objects aren't appearing in the DR buckets | Replication only applies to objects uploaded **after** it was enabled — existing objects at the time you turn on `EnableReplication` are not retroactively replicated. Re-upload (or use S3 Batch Replication separately) to backfill older objects |
+| DR bucket images don't show reduced storage costs over time the way the source bucket does | Expected — the DR buckets have no lifecycle rules of their own in this setup, so replicated objects stay at whatever storage class they arrived in and don't independently transition to IA/Glacier. See "Disaster recovery" above |
+| `AccessDenied` during replication (visible in the source bucket's replication metrics) | Check the `ReplicationRole`'s policy actually covers both source bucket ARNs and both destination bucket ARNs — a mismatched or stale `DestinationWebsiteBucketArn`/`DestinationImagesBucketArn` parameter value is the most common cause |
+| CloudFormation refuses to delete a bucket during teardown | Versioned buckets need every version and delete marker removed, not just current objects — see the updated "Tearing down" section above |
+| `InsufficientCapabilitiesException: Requires capabilities: [CAPABILITY_NAMED_IAM]` | The `ReplicationRole` has an explicit name, which requires `CAPABILITY_NAMED_IAM` in addition to `CAPABILITY_IAM` — add both to your `--capabilities` flag |

@@ -6,8 +6,9 @@ Description: >
   not publicly accessible. Also creates a separate, fully private S3
   bucket for product images, added to the distribution as a second
   origin with its own OAC and routed via a /images/* path pattern.
-  Both buckets have S3 Transfer Acceleration enabled for faster
-  uploads via CloudFront edge locations. Optionally attaches an
+  Optionally enables S3 Cross-Region Replication from both buckets to
+  destination buckets in a secondary region (created separately via
+  shopme-dr.yaml) for disaster recovery. Optionally attaches an
   existing WAF Web ACL (created separately via shopme-waf.yaml in
   us-east-1) for SQL injection protection, a custom domain with ACM
   certificate, and a CloudWatch dashboard for CloudFront Requests and
@@ -70,9 +71,41 @@ Parameters:
       Must be a valid S3 bucket name (lowercase letters, numbers, dots,
       hyphens, 3-63 characters).
 
+  EnableReplication:
+    Type: String
+    Description: >
+      Whether to enable S3 Cross-Region Replication from both source
+      buckets to DR destination buckets in a secondary region. The
+      destination buckets are NOT created by this template — deploy
+      shopme-dr.yaml to your chosen DR region first, then pass its
+      DRWebsiteBucketArn / DRImagesBucketArn outputs as the
+      DestinationWebsiteBucketArn / DestinationImagesBucketArn
+      parameters here. Set to "false" to skip replication entirely.
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  DestinationWebsiteBucketArn:
+    Type: String
+    Description: >
+      ARN of the DR destination bucket for the website bucket (output
+      of shopme-dr.yaml, deployed separately in a secondary region).
+      Required if EnableReplication is "true"; ignored otherwise.
+    Default: ""
+
+  DestinationImagesBucketArn:
+    Type: String
+    Description: >
+      ARN of the DR destination bucket for the images bucket (output
+      of shopme-dr.yaml, deployed separately in a secondary region).
+      Required if EnableReplication is "true"; ignored otherwise.
+    Default: ""
+
 Conditions:
   CreateWAF: !Equals [!Ref EnableWAF, "true"]
   HasCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  CreateReplication: !Equals [!Ref EnableReplication, "true"]
 
 Resources:
 
@@ -97,6 +130,11 @@ Resources:
       WebsiteConfiguration:
         IndexDocument: index.html
         ErrorDocument: index.html
+      # Required for Cross-Region Replication (and generally good
+      # practice) — keeps every version of every object, not just the
+      # latest.
+      VersioningConfiguration:
+        Status: Enabled
       # Note: S3 Transfer Acceleration is NOT compatible with buckets
       # that have static website hosting configured (AWS rejects it
       # with a 405 error) — so acceleration is only enabled on the
@@ -106,6 +144,22 @@ Resources:
       # incur a small additional cost (S3 request metrics pricing).
       MetricsConfigurations:
         - Id: EntireBucket
+      # Replicates every object (including its current storage class)
+      # to a DR bucket in a secondary region — only when EnableReplication
+      # is "true"; omitted entirely otherwise.
+      ReplicationConfiguration: !If
+        - CreateReplication
+        - Role: !GetAtt ReplicationRole.Arn
+          Rules:
+            - Id: ReplicateWebsiteBucket
+              Status: Enabled
+              Priority: 1
+              DeleteMarkerReplication:
+                Status: Disabled
+              Filter: {}
+              Destination:
+                Bucket: !Ref DestinationWebsiteBucketArn
+        - !Ref "AWS::NoValue"
       Tags:
         - Key: Project
           Value: Shopme
@@ -161,6 +215,11 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # Required for Cross-Region Replication (and generally good
+      # practice) — keeps every version of every object, not just the
+      # latest.
+      VersioningConfiguration:
+        Status: Enabled
       # S3 Transfer Acceleration is NOT enabled here: this bucket is in
       # eu-north-1 (Stockholm), an AWS "opt-in" region where Transfer
       # Acceleration is unsupported (AWS excludes several opt-in
@@ -180,6 +239,22 @@ Resources:
                 StorageClass: STANDARD_IA
               - TransitionInDays: 180
                 StorageClass: GLACIER
+      # Replicates every object (including its current storage class)
+      # to a DR bucket in a secondary region — only when EnableReplication
+      # is "true"; omitted entirely otherwise.
+      ReplicationConfiguration: !If
+        - CreateReplication
+        - Role: !GetAtt ReplicationRole.Arn
+          Rules:
+            - Id: ReplicateImagesBucket
+              Status: Enabled
+              Priority: 1
+              DeleteMarkerReplication:
+                Status: Disabled
+              Filter: {}
+              Destination:
+                Bucket: !Ref DestinationImagesBucketArn
+        - !Ref "AWS::NoValue"
       Tags:
         - Key: Project
           Value: Shopme
@@ -217,6 +292,60 @@ Resources:
         OriginAccessControlOriginType: s3
         SigningBehavior: always
         SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------
+  # IAM role S3 assumes to replicate objects from the source buckets to
+  # the DR destination buckets. Only created when EnableReplication is
+  # "true" — the two bucket ReplicationConfiguration properties above
+  # reference this role's ARN only within their own CreateReplication
+  # branch, so there's no dangling reference when it's condition-skipped.
+  # ---------------------------------------------------------------------
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Condition: CreateReplication
+    Properties:
+      RoleName: !Sub "${BucketName}-s3-replication-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReplicationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SourceBucketPermissions
+                Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}"
+                  - !Sub "arn:aws:s3:::${ImagesBucketName}"
+              - Sid: SourceObjectPermissions
+                Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource:
+                  - !Sub "arn:aws:s3:::${BucketName}/*"
+                  - !Sub "arn:aws:s3:::${ImagesBucketName}/*"
+              - Sid: DestinationObjectPermissions
+                Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource:
+                  - !Sub "${DestinationWebsiteBucketArn}/*"
+                  - !Sub "${DestinationImagesBucketArn}/*"
+      Tags:
+        - Key: Project
+          Value: Shopme
 
   # ---------------------------------------------------------------------
   # Note: the WAF Web ACL is NOT created here. WAF Web ACLs with
@@ -395,3 +524,10 @@ Outputs:
   ImagesBucketDomainName:
     Description: Images bucket regional domain name (CloudFront origin)
     Value: !GetAtt ImagesBucket.RegionalDomainName
+
+  ReplicationRoleArn:
+    Description: >
+      ARN of the IAM role used for S3 Cross-Region Replication (blank
+      if EnableReplication is false)
+    Condition: CreateReplication
+    Value: !GetAtt ReplicationRole.Arn
