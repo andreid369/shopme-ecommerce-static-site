@@ -53,7 +53,7 @@ Value: _yyyyyyyyyyyyyyyy.xyzcompany.acm-validations.aws.
 
 ```bash
 aws acm describe-certificate \
-  --certificate-arn arn:aws:acm:us-east-1:682563173107:certificate/944000e2-6c1a-4431-a3dd-4c6138eaf589 \
+  --certificate-arn arn:aws:acm:us-east-1:<ACCOUNT_ID>:certificate/944000e2-6c1a-4431-a3dd-4c6138eaf589 \
   --region us-east-1 \
   --query "Certificate.Status"
 ```
@@ -151,6 +151,6 @@ in your browser — it should show it's issued for `shop.mydomain.com`).
 Parameter	Value to use	Purpose
 BucketName	shopme-website-123456789012	Your S3 bucket name
 EnableWAF	true	Turns WAF on
-WebACLArn	arn:aws:wafv2:us-east-1:682563173107:global/webacl/shopme-website-waf/f8dee533-b41d-4a7a-84c6-f8504c30ed38
+WebACLArn	arn:aws:wafv2:us-east-1:<ACCOUNT_ID>:global/webacl/shopme-website-waf/f8dee533-b41d-4a7a-84c6-f8504c30ed38
 DomainName	shop.opencloud.ro	Your custom domain
-AcmCertificateArn	arn:aws:acm:us-east-1:682563173107:certificate/944000e2-6c1a-4431-a3dd-4c6138eaf589	Your HTTPS certificate
+AcmCertificateArn	arn:aws:acm:us-east-1:<ACCOUNT_ID>:certificate/944000e2-6c1a-4431-a3dd-4c6138eaf589	Your HTTPS certificate

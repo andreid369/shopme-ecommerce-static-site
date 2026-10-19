@@ -115,7 +115,7 @@ aws cloudformation deploy \
 aws cloudformation deploy \
   --template-file shopme-s3-website.yaml \
   --stack-name shopme-website \
-  --parameter-overrides BucketName=shopme-website-123456789012 WebACLArn=arn:aws:wafv2:us-east-1:682563173107:global/webacl/shopme-website-waf/f8dee533-b41d-4a7a-84c6-f8504c30ed38 \
+  --parameter-overrides BucketName=shopme-website-123456789012 WebACLArn=arn:aws:wafv2:us-east-1:<ACCOUNT_ID>:global/webacl/shopme-website-waf/f8dee533-b41d-4a7a-84c6-f8504c30ed38 \
   --capabilities CAPABILITY_IAM \
   --region eu-north-1
   
