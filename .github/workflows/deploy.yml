@@ -7,6 +7,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
+  id-token: write   # required for AWS OIDC authentication
   contents: read
 
 jobs:
@@ -20,8 +21,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
 
       - name: Sync website files to S3 (excluding images/)
