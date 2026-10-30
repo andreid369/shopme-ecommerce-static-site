@@ -18,6 +18,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: TEMP - show OIDC identity claims (no secrets)
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+          echo "::add-mask::$TOKEN"
+          jq -R 'split(".") | .[1] | gsub("-";"+") | gsub("_";"/") | . + "===" | @base64d | fromjson | {iss, aud, sub, event_name, ref, repository}' <<< "$TOKEN"
+          echo "role secret length: ${#ROLE_ARN} chars, starts with: ${ROLE_ARN:0:13}, ends with: ${ROLE_ARN: -26}"
+        env:
+          ROLE_ARN: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
